@@ -7,6 +7,10 @@ import spaces
 from typing import Optional, Tuple
 from funasr import AutoModel
 from pathlib import Path
+import logging
+
+# 抑制 ModelScope 的警告信息（不影响功能）
+logging.getLogger('modelscope').setLevel(logging.ERROR)
 
 # 设置模型缓存目录到项目目录
 PROJECT_ROOT = Path(__file__).parent.absolute()
@@ -83,9 +87,13 @@ class VoxCPMDemo:
             self.voxcpm_model = voxcpm.VoxCPM.from_pretrained(
                 hf_model_id=os.environ.get("HF_REPO_ID", "openbmb/VoxCPM1.5"),
                 cache_dir=cache_dir,
+                optimize=False,  # 在 Web 界面中禁用优化以避免多线程问题
             )
         else:
-            self.voxcpm_model = voxcpm.VoxCPM(voxcpm_model_path=model_dir)
+            self.voxcpm_model = voxcpm.VoxCPM(
+                voxcpm_model_path=model_dir,
+                optimize=False,  # 在 Web 界面中禁用优化以避免多线程问题
+            )
         print("Model loaded successfully.")
         return self.voxcpm_model
 
@@ -289,6 +297,7 @@ def run_demo(server_name: str = "localhost", server_port: int = 7860, show_error
     demo = VoxCPMDemo()
     interface = create_demo_interface(demo)
     # Recommended to enable queue on Spaces for better throughput
+    # default_concurrency_limit=1 确保单线程执行，避免 torch.compile CUDA graph 多线程问题
     interface.queue(max_size=10, default_concurrency_limit=1).launch(server_name=server_name, server_port=server_port, show_error=show_error)
 
 
