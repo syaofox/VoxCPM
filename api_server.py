@@ -7,8 +7,9 @@ import io
 import json
 import logging
 import tempfile
+import re
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List
 import numpy as np
 import torch
 import soundfile as sf
@@ -42,6 +43,80 @@ app = FastAPI(title="VoxCPM TTS API", description="VoxCPM Text-to-Speech API for
 
 # 全局模型实例
 voxcpm_model: Optional[voxcpm.VoxCPM] = None
+
+
+def split_text_into_sentences(text: str, max_length: int = 100) -> List[str]:
+    """
+    将长文本分割成句子，用于流式生成
+    优先按标点符号分割，如果句子太长则按长度分割
+    
+    Args:
+        text: 输入文本
+        max_length: 单个句子的最大长度（字符数）
+    
+    Returns:
+        句子列表
+    """
+    if not text.strip():
+        return []
+    
+    # 中文和英文的标点符号
+    punctuation_marks = ['。', '？', '！', '；', '.', '?', '!', ';']
+    
+    sentences = []
+    current_sentence = ""
+    
+    i = 0
+    while i < len(text):
+        char = text[i]
+        current_sentence += char
+        
+        # 如果遇到标点符号，结束当前句子
+        if char in punctuation_marks:
+            # 检查下一个字符是否是引号
+            if i + 1 < len(text) and text[i + 1] in ['"', '"', '"', '"', ''', ''']:
+                current_sentence += text[i + 1]
+                i += 2
+            else:
+                i += 1
+            
+            if current_sentence.strip():
+                sentences.append(current_sentence.strip())
+            current_sentence = ""
+        # 如果当前句子太长，强制分割
+        elif len(current_sentence) >= max_length:
+            # 尝试在空格或逗号处分割
+            last_space = current_sentence.rfind(' ')
+            last_comma = current_sentence.rfind('，')
+            last_comma_en = current_sentence.rfind(',')
+            split_pos = max(last_space, last_comma, last_comma_en)
+            
+            if split_pos > max_length * 0.5:  # 如果找到合适的分割点
+                sentences.append(current_sentence[:split_pos + 1].strip())
+                current_sentence = current_sentence[split_pos + 1:]
+            else:
+                # 没有合适的分割点，直接按长度分割
+                sentences.append(current_sentence.strip())
+                current_sentence = ""
+            i += 1
+        else:
+            i += 1
+    
+    # 添加剩余的文本
+    if current_sentence.strip():
+        sentences.append(current_sentence.strip())
+    
+    # 过滤空句子
+    sentences = [s for s in sentences if s.strip()]
+    
+    # 如果没有找到任何句子（比如没有标点），按长度分割
+    if not sentences:
+        for i in range(0, len(text), max_length):
+            chunk = text[i:i + max_length].strip()
+            if chunk:
+                sentences.append(chunk)
+    
+    return sentences if sentences else [text]
 
 
 class TTSRequest(BaseModel):
@@ -260,19 +335,85 @@ async def text_to_speech(request: Request):
         if stream_mode:
             def generate_audio_stream():
                 try:
-                    for chunk in model.generate_streaming(
-                        text=text,
-                        prompt_text=prompt_text,
-                        prompt_wav_path=prompt_wav_path,
-                        cfg_value=tts_request.cfg_value or 2.0,
-                        inference_timesteps=tts_request.inference_timesteps or 10,
-                        normalize=tts_request.normalize or False,
-                        denoise=tts_request.denoise or False,
-                    ):
-                        # 将音频块转换为 16-bit PCM 格式
-                        chunk_int16 = (chunk * 32767).astype(np.int16)
-                        chunk_bytes = chunk_int16.tobytes()
-                        yield chunk_bytes
+                    # 文本规范化（如果需要）
+                    normalized_text = text
+                    if tts_request.normalize or False:
+                        if model.text_normalizer is None:
+                            from voxcpm.utils.text_normalize import TextNormalizer
+                            model.text_normalizer = TextNormalizer()
+                        normalized_text = model.text_normalizer.normalize(text)
+                    
+                    # 将长文本分割成句子，实现更快的首字节时间
+                    sentences = split_text_into_sentences(normalized_text, max_length=100)
+                    print(f"文本已分割为 {len(sentences)} 个句子，总长度: {len(normalized_text)} 字符")
+                    
+                    # 构建 prompt_cache（如果有参考音频），用于后续复用
+                    prompt_cache = None
+                    if prompt_wav_path and prompt_text:
+                        print("构建参考音频的 prompt cache...")
+                        # 处理降噪（如果需要）
+                        actual_prompt_wav_path = prompt_wav_path
+                        temp_prompt_wav_path = None
+                        if tts_request.denoise or False and model.denoiser is not None:
+                            temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.wav')
+                            temp_prompt_wav_path = temp_file.name
+                            temp_file.close()
+                            model.denoiser.enhance(prompt_wav_path, output_path=temp_prompt_wav_path)
+                            actual_prompt_wav_path = temp_prompt_wav_path
+                        
+                        try:
+                            prompt_cache = model.tts_model.build_prompt_cache(
+                                prompt_wav_path=actual_prompt_wav_path,
+                                prompt_text=prompt_text
+                            )
+                            print("Prompt cache 构建完成")
+                        finally:
+                            # 清理临时文件
+                            if temp_prompt_wav_path and os.path.exists(temp_prompt_wav_path):
+                                try:
+                                    os.unlink(temp_prompt_wav_path)
+                                except OSError:
+                                    pass
+                    
+                    # 对每个句子进行流式生成
+                    for i, sentence in enumerate(sentences):
+                        print(f"正在生成第 {i+1}/{len(sentences)} 句: '{sentence[:50]}...'")
+                        
+                        # 如果有 prompt_cache，直接使用底层方法以复用 cache
+                        if prompt_cache is not None:
+                            # 使用底层方法，直接传递 prompt_cache
+                            generate_result = model.tts_model._generate_with_prompt_cache(
+                                target_text=sentence,
+                                prompt_cache=prompt_cache,
+                                min_len=2,
+                                max_len=4096,
+                                inference_timesteps=tts_request.inference_timesteps or 10,
+                                cfg_value=tts_request.cfg_value or 2.0,
+                                retry_badcase=False,  # 流式模式下禁用重试
+                                streaming=True,
+                            )
+                            for wav, _, _ in generate_result:
+                                chunk = wav.squeeze(0).cpu().numpy()
+                                chunk_int16 = (chunk * 32767).astype(np.int16)
+                                chunk_bytes = chunk_int16.tobytes()
+                                yield chunk_bytes
+                        else:
+                            # 没有 prompt_cache，使用标准方法
+                            # 注意：每次调用都是独立的，但至少可以快速返回第一个句子的结果
+                            for chunk in model.generate_streaming(
+                                text=sentence,
+                                prompt_text=None,
+                                prompt_wav_path=None,
+                                cfg_value=tts_request.cfg_value or 2.0,
+                                inference_timesteps=tts_request.inference_timesteps or 10,
+                                normalize=False,  # 已经在上面规范化了
+                                denoise=False,  # 不需要再次降噪
+                            ):
+                                # 将音频块转换为 16-bit PCM 格式
+                                chunk_int16 = (chunk * 32767).astype(np.int16)
+                                chunk_bytes = chunk_int16.tobytes()
+                                yield chunk_bytes
+                            
                 except Exception as e:
                     logging.error(f"流式生成过程中出错: {str(e)}", exc_info=True)
                     raise
@@ -453,25 +594,83 @@ async def text_to_speech_stream(request: TTSRequest):
         # 流式生成语音
         def generate_audio_stream():
             try:
-                # 首先发送采样率信息（作为 JSON 元数据，可选）
-                # 或者直接开始发送音频数据
+                # 文本规范化（如果需要）
+                normalized_text = text
+                if request.normalize or False:
+                    if model.text_normalizer is None:
+                        from voxcpm.utils.text_normalize import TextNormalizer
+                        model.text_normalizer = TextNormalizer()
+                    normalized_text = model.text_normalizer.normalize(text)
                 
-                # 使用流式生成
-                for chunk in model.generate_streaming(
-                    text=text,
-                    prompt_text=prompt_text,
-                    prompt_wav_path=prompt_wav_path,
-                    cfg_value=request.cfg_value or 2.0,
-                    inference_timesteps=request.inference_timesteps or 10,
-                    normalize=request.normalize or False,
-                    denoise=request.denoise or False,
-                ):
-                    # 将音频块转换为 16-bit PCM 格式
-                    # chunk 是 float32 格式，范围通常在 [-1, 1]
-                    chunk_int16 = (chunk * 32767).astype(np.int16)
-                    # 转换为字节流
-                    chunk_bytes = chunk_int16.tobytes()
-                    yield chunk_bytes
+                # 将长文本分割成句子，实现更快的首字节时间
+                sentences = split_text_into_sentences(normalized_text, max_length=100)
+                print(f"文本已分割为 {len(sentences)} 个句子，总长度: {len(normalized_text)} 字符")
+                
+                # 构建 prompt_cache（如果有参考音频），用于后续复用
+                prompt_cache = None
+                if prompt_wav_path and prompt_text:
+                    print("构建参考音频的 prompt cache...")
+                    # 处理降噪（如果需要）
+                    actual_prompt_wav_path = prompt_wav_path
+                    temp_prompt_wav_path = None
+                    if request.denoise or False and model.denoiser is not None:
+                        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.wav')
+                        temp_prompt_wav_path = temp_file.name
+                        temp_file.close()
+                        model.denoiser.enhance(prompt_wav_path, output_path=temp_prompt_wav_path)
+                        actual_prompt_wav_path = temp_prompt_wav_path
+                    
+                    try:
+                        prompt_cache = model.tts_model.build_prompt_cache(
+                            prompt_wav_path=actual_prompt_wav_path,
+                            prompt_text=prompt_text
+                        )
+                        print("Prompt cache 构建完成")
+                    finally:
+                        # 清理临时文件
+                        if temp_prompt_wav_path and os.path.exists(temp_prompt_wav_path):
+                            try:
+                                os.unlink(temp_prompt_wav_path)
+                            except OSError:
+                                pass
+                
+                # 对每个句子进行流式生成
+                for i, sentence in enumerate(sentences):
+                    print(f"正在生成第 {i+1}/{len(sentences)} 句: '{sentence[:50]}...'")
+                    
+                    # 如果有 prompt_cache，直接使用底层方法以复用 cache
+                    if prompt_cache is not None:
+                        # 使用底层方法，直接传递 prompt_cache
+                        generate_result = model.tts_model._generate_with_prompt_cache(
+                            target_text=sentence,
+                            prompt_cache=prompt_cache,
+                            min_len=2,
+                            max_len=4096,
+                            inference_timesteps=request.inference_timesteps or 10,
+                            cfg_value=request.cfg_value or 2.0,
+                            retry_badcase=False,  # 流式模式下禁用重试
+                            streaming=True,
+                        )
+                        for wav, _, _ in generate_result:
+                            chunk = wav.squeeze(0).cpu().numpy()
+                            chunk_int16 = (chunk * 32767).astype(np.int16)
+                            chunk_bytes = chunk_int16.tobytes()
+                            yield chunk_bytes
+                    else:
+                        # 没有 prompt_cache，使用标准方法
+                        for chunk in model.generate_streaming(
+                            text=sentence,
+                            prompt_text=None,
+                            prompt_wav_path=None,
+                            cfg_value=request.cfg_value or 2.0,
+                            inference_timesteps=request.inference_timesteps or 10,
+                            normalize=False,  # 已经在上面规范化了
+                            denoise=False,  # 不需要再次降噪
+                        ):
+                            # 将音频块转换为 16-bit PCM 格式
+                            chunk_int16 = (chunk * 32767).astype(np.int16)
+                            chunk_bytes = chunk_int16.tobytes()
+                            yield chunk_bytes
                     
             except Exception as e:
                 logging.error(f"流式生成过程中出错: {str(e)}", exc_info=True)
