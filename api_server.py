@@ -135,8 +135,9 @@ async def root():
         "version": "1.0.0",
         "description": "VoxCPM Text-to-Speech API for Legado Reader",
         "endpoints": {
-            "/tts": "POST - 文本转语音（JSON格式，支持参考音频路径）",
+            "/tts": "POST - 文本转语音（JSON格式，支持参考音频路径）。添加 ?stream=true 启用流式输出",
             "/tts/upload": "POST - 文本转语音（multipart/form-data，支持上传参考音频）",
+            "/tts/stream": "POST - 流式文本转语音（PCM格式，适合长文本）",
             "/health": "GET - 健康检查"
         }
     }
@@ -176,12 +177,17 @@ async def text_to_speech(request: Request):
     文本转语音端点（JSON格式）
     支持 Legado 阅读器的 httpTTS API 格式
     支持声音克隆：通过 prompt_wav_path 和 prompt_text 参数
+    支持流式输出：通过查询参数 ?stream=true
     """
     try:
+        # 检查是否启用流式输出
+        stream_mode = request.query_params.get("stream", "false").lower() == "true"
+        
         # 记录请求信息用于调试
         print(f"\n{'='*60}")
         print(f"收到 POST 请求: {request.url}")
         print(f"请求方法: {request.method}")
+        print(f"流式模式: {stream_mode}")
         print(f"请求头: {dict(request.headers)}")
         
         # 读取请求体
@@ -247,6 +253,42 @@ async def text_to_speech(request: Request):
         else:
             print(f"标准语音合成，文本: '{text[:60]}...'")
         
+        # 获取采样率
+        sample_rate = model.tts_model.sample_rate
+        
+        # 流式输出模式
+        if stream_mode:
+            def generate_audio_stream():
+                try:
+                    for chunk in model.generate_streaming(
+                        text=text,
+                        prompt_text=prompt_text,
+                        prompt_wav_path=prompt_wav_path,
+                        cfg_value=tts_request.cfg_value or 2.0,
+                        inference_timesteps=tts_request.inference_timesteps or 10,
+                        normalize=tts_request.normalize or False,
+                        denoise=tts_request.denoise or False,
+                    ):
+                        # 将音频块转换为 16-bit PCM 格式
+                        chunk_int16 = (chunk * 32767).astype(np.int16)
+                        chunk_bytes = chunk_int16.tobytes()
+                        yield chunk_bytes
+                except Exception as e:
+                    logging.error(f"流式生成过程中出错: {str(e)}", exc_info=True)
+                    raise
+            
+            return StreamingResponse(
+                generate_audio_stream(),
+                media_type="audio/pcm",
+                headers={
+                    "Content-Type": f"audio/pcm; rate={sample_rate}; channels=1; encoding=pcm_s16le",
+                    "X-Sample-Rate": str(sample_rate),
+                    "X-Channels": "1",
+                    "X-Encoding": "pcm_s16le",
+                }
+            )
+        
+        # 非流式输出模式（默认）
         # 生成语音
         wav = model.generate(
             text=text,
@@ -257,9 +299,6 @@ async def text_to_speech(request: Request):
             normalize=tts_request.normalize or False,
             denoise=tts_request.denoise or False,
         )
-        
-        # 获取采样率
-        sample_rate = model.tts_model.sample_rate
         
         # 将音频数据转换为 WAV 格式的字节流
         buffer = io.BytesIO()
@@ -377,8 +416,9 @@ async def text_to_speech_with_upload(
 @app.post("/tts/stream")
 async def text_to_speech_stream(request: TTSRequest):
     """
-    流式文本转语音端点（实验性）
+    流式文本转语音端点
     支持流式生成，适合长文本
+    返回格式：PCM 音频流（16-bit, 单声道）
     """
     try:
         # 获取模型
@@ -389,41 +429,69 @@ async def text_to_speech_stream(request: TTSRequest):
         if len(text) == 0:
             raise HTTPException(status_code=400, detail="文本内容不能为空")
         
+        # 验证参考音频参数
+        prompt_wav_path = request.prompt_wav_path
+        prompt_text = request.prompt_text
+        
+        if (prompt_wav_path is not None) != (prompt_text is not None):
+            raise HTTPException(
+                status_code=400, 
+                detail="参考音频和参考文本必须同时提供或同时为空"
+            )
+        
+        if prompt_wav_path and not os.path.exists(prompt_wav_path):
+            raise HTTPException(
+                status_code=400,
+                detail=f"参考音频文件不存在: {prompt_wav_path}"
+            )
+        
         print(f"正在流式生成语音，文本: '{text[:60]}...'")
+        
+        # 获取采样率
+        sample_rate = model.tts_model.sample_rate
         
         # 流式生成语音
         def generate_audio_stream():
-            chunks = []
-            for chunk in model.generate_streaming(
-                text=text,
-                cfg_value=request.cfg_value or 2.0,
-                inference_timesteps=request.inference_timesteps or 10,
-                normalize=request.normalize or False,
-                denoise=request.denoise or False,
-            ):
-                chunks.append(chunk)
-                # 可以在这里实现真正的流式传输
-                # 目前先收集所有块
-            
-            # 合并所有块
-            wav = np.concatenate(chunks)
-            sample_rate = model.tts_model.sample_rate
-            
-            # 转换为 WAV 格式
-            buffer = io.BytesIO()
-            sf.write(buffer, wav, sample_rate, format='WAV')
-            buffer.seek(0)
-            
-            yield buffer.read()
+            try:
+                # 首先发送采样率信息（作为 JSON 元数据，可选）
+                # 或者直接开始发送音频数据
+                
+                # 使用流式生成
+                for chunk in model.generate_streaming(
+                    text=text,
+                    prompt_text=prompt_text,
+                    prompt_wav_path=prompt_wav_path,
+                    cfg_value=request.cfg_value or 2.0,
+                    inference_timesteps=request.inference_timesteps or 10,
+                    normalize=request.normalize or False,
+                    denoise=request.denoise or False,
+                ):
+                    # 将音频块转换为 16-bit PCM 格式
+                    # chunk 是 float32 格式，范围通常在 [-1, 1]
+                    chunk_int16 = (chunk * 32767).astype(np.int16)
+                    # 转换为字节流
+                    chunk_bytes = chunk_int16.tobytes()
+                    yield chunk_bytes
+                    
+            except Exception as e:
+                logging.error(f"流式生成过程中出错: {str(e)}", exc_info=True)
+                # 注意：一旦开始流式传输，无法发送 HTTP 错误响应
+                # 可以考虑发送错误标记或记录日志
+                raise
         
         return StreamingResponse(
             generate_audio_stream(),
-            media_type="audio/wav",
+            media_type="audio/pcm",
             headers={
-                "Content-Disposition": "attachment; filename=tts_stream.wav"
+                "Content-Type": f"audio/pcm; rate={sample_rate}; channels=1; encoding=pcm_s16le",
+                "X-Sample-Rate": str(sample_rate),
+                "X-Channels": "1",
+                "X-Encoding": "pcm_s16le",
             }
         )
         
+    except HTTPException:
+        raise
     except Exception as e:
         logging.error(f"流式生成语音时出错: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"流式生成语音失败: {str(e)}")
