@@ -111,6 +111,23 @@ class VoxCPM:
         if os.path.isdir(repo_id):
             local_path = repo_id
         else:
+            # 如果未指定 cache_dir，尝试使用项目目录下的缓存
+            if cache_dir is None:
+                from pathlib import Path
+                # 尝试检测项目根目录（查找包含 pyproject.toml 的目录）
+                current_file = Path(__file__).resolve()
+                project_root = None
+                for parent in current_file.parents:
+                    if (parent / "pyproject.toml").exists():
+                        project_root = parent
+                        break
+                
+                if project_root:
+                    project_cache = project_root / "models_cache" / "huggingface" / "hub"
+                    cache_dir = str(project_cache)
+                    # 确保目录存在
+                    os.makedirs(cache_dir, exist_ok=True)
+            
             # Otherwise, try from_pretrained (Hub); exit on failure
             local_path = snapshot_download(
                 repo_id=repo_id,

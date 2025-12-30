@@ -7,6 +7,18 @@ import spaces
 from typing import Optional, Tuple
 from funasr import AutoModel
 from pathlib import Path
+
+# 设置模型缓存目录到项目目录
+PROJECT_ROOT = Path(__file__).parent.absolute()
+MODELS_CACHE_DIR = PROJECT_ROOT / "models_cache"
+
+# 设置 HuggingFace 缓存目录
+os.environ["HF_HOME"] = str(MODELS_CACHE_DIR / "huggingface")
+os.environ["HF_HUB_CACHE"] = str(MODELS_CACHE_DIR / "huggingface" / "hub")
+
+# 设置 ModelScope 缓存目录
+os.environ["MODELSCOPE_CACHE"] = str(MODELS_CACHE_DIR / "modelscope" / "hub")
+
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 if os.environ.get("HF_REPO_ID", "").strip() == "":
     os.environ["HF_REPO_ID"] = "openbmb/VoxCPM1.5"
@@ -63,9 +75,18 @@ class VoxCPMDemo:
             return self.voxcpm_model
         print("Model not loaded, initializing...", file=sys.stderr)
         model_dir = self._resolve_model_dir()
-        print(f"Using model dir: {model_dir}", file=sys.stderr)
-        self.voxcpm_model = voxcpm.VoxCPM(voxcpm_model_path=model_dir)
-        print("Model loaded successfully.", file=sys.stderr)
+        print(f"Using model dir: {model_dir}")
+        # 如果本地目录不存在，使用 from_pretrained 下载到项目缓存目录
+        if not os.path.isdir(model_dir):
+            print(f"Downloading model to project cache directory...")
+            cache_dir = str(MODELS_CACHE_DIR / "huggingface" / "hub")
+            self.voxcpm_model = voxcpm.VoxCPM.from_pretrained(
+                hf_model_id=os.environ.get("HF_REPO_ID", "openbmb/VoxCPM1.5"),
+                cache_dir=cache_dir,
+            )
+        else:
+            self.voxcpm_model = voxcpm.VoxCPM(voxcpm_model_path=model_dir)
+        print("Model loaded successfully.")
         return self.voxcpm_model
 
     # ---------- Functional endpoints ----------
