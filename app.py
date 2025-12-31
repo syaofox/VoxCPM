@@ -4,10 +4,12 @@ import numpy as np
 import torch
 import gradio as gr  
 import spaces
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List, Dict
 from funasr import AutoModel
 from pathlib import Path
 import logging
+import hashlib
+import tempfile
 
 # 抑制 ModelScope 的警告信息（不影响功能）
 logging.getLogger('modelscope').setLevel(logging.ERROR)
@@ -30,6 +32,101 @@ if os.environ.get("HF_REPO_ID", "").strip() == "":
 import voxcpm
 
 
+def split_text_into_sentences(text: str, max_length: int = 200) -> List[str]:
+    """
+    将长文本分割成句子，用于避免显存溢出
+    
+    分割策略：
+    1. 优先按换行符分割
+    2. 对于每一行，如果超过 max_length 字符，再按照句号、叹号、问号等标点符号分割
+    
+    Args:
+        text: 输入文本
+        max_length: 单个句子的最大长度（字符数），超过此长度会在标点处分割
+    
+    Returns:
+        句子列表
+    """
+    if not text.strip():
+        return []
+    
+    # 句末标点符号（用于句子分割）
+    sentence_endings = ['。', '？', '！', '.', '?', '!']
+    
+    # 第一步：按换行符分割
+    lines = text.split('\n')
+    sentences = []
+    
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        
+        # 如果这一行不超过 max_length，直接添加
+        if len(line) <= max_length:
+            sentences.append(line)
+            continue
+        
+        # 如果这一行超过 max_length，按句末标点符号分割
+        current_sentence = ""
+        i = 0
+        
+        while i < len(line):
+            char = line[i]
+            current_sentence += char
+            
+            # 如果遇到句末标点符号，结束当前句子
+            if char in sentence_endings:
+                # 检查下一个字符是否是引号
+                if i + 1 < len(line) and line[i + 1] in ['"', '"', '"', '"', ''', ''']:
+                    current_sentence += line[i + 1]
+                    i += 2
+                else:
+                    i += 1
+                
+                if current_sentence.strip():
+                    sentences.append(current_sentence.strip())
+                current_sentence = ""
+            # 如果当前句子太长，尝试在逗号或分号处分割
+            elif len(current_sentence) >= max_length:
+                # 尝试在逗号、分号或空格处分割
+                last_comma_zh = current_sentence.rfind('，')
+                last_comma_en = current_sentence.rfind(',')
+                last_semicolon_zh = current_sentence.rfind('；')
+                last_semicolon_en = current_sentence.rfind(';')
+                last_space = current_sentence.rfind(' ')
+                
+                split_pos = max(last_comma_zh, last_comma_en, last_semicolon_zh, 
+                               last_semicolon_en, last_space)
+                
+                if split_pos > max_length * 0.5:  # 如果找到合适的分割点
+                    sentences.append(current_sentence[:split_pos + 1].strip())
+                    current_sentence = current_sentence[split_pos + 1:]
+                else:
+                    # 没有合适的分割点，直接按长度分割
+                    sentences.append(current_sentence.strip())
+                    current_sentence = ""
+                i += 1
+            else:
+                i += 1
+        
+        # 添加剩余的文本
+        if current_sentence.strip():
+            sentences.append(current_sentence.strip())
+    
+    # 过滤空句子
+    sentences = [s for s in sentences if s.strip()]
+    
+    # 如果没有找到任何句子（比如没有换行也没有标点），按长度分割
+    if not sentences:
+        for i in range(0, len(text), max_length):
+            chunk = text[i:i + max_length].strip()
+            if chunk:
+                sentences.append(chunk)
+    
+    return sentences if sentences else [text]
+
+
 class VoxCPMDemo:
     def __init__(self) -> None:
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -47,6 +144,9 @@ class VoxCPMDemo:
         # TTS model (lazy init)
         self.voxcpm_model: Optional[voxcpm.VoxCPM] = None
         self.default_local_model_dir = "./models/VoxCPM1.5"
+        
+        # Prompt cache 缓存：key 为 (prompt_wav_path, prompt_text) 的哈希，value 为 prompt_cache
+        self.prompt_cache_dict: Dict[str, dict] = {}
 
     # ---------- Model helpers ----------
     def _resolve_model_dir(self) -> str:
@@ -104,6 +204,68 @@ class VoxCPMDemo:
         res = self.asr_model.generate(input=prompt_wav, language="auto", use_itn=True)
         text = res[0]["text"].split('|>')[-1]
         return text
+    
+    def _get_prompt_cache_key(self, prompt_wav_path: Optional[str], prompt_text: Optional[str]) -> Optional[str]:
+        """生成 prompt cache 的键"""
+        if prompt_wav_path is None or prompt_text is None:
+            return None
+        # 使用文件路径和文本内容的哈希作为键
+        key_str = f"{prompt_wav_path}:{prompt_text}"
+        return hashlib.md5(key_str.encode()).hexdigest()
+    
+    def _get_or_build_prompt_cache(
+        self, 
+        prompt_wav_path: Optional[str], 
+        prompt_text: Optional[str],
+        denoise: bool = False
+    ) -> Optional[dict]:
+        """获取或构建 prompt cache"""
+        if prompt_wav_path is None or prompt_text is None:
+            return None
+        
+        cache_key = self._get_prompt_cache_key(prompt_wav_path, prompt_text)
+        if cache_key is None:
+            return None
+        
+        # 如果缓存中存在，直接返回
+        if cache_key in self.prompt_cache_dict:
+            print(f"使用缓存的 prompt cache (key: {cache_key[:8]}...)")
+            return self.prompt_cache_dict[cache_key]
+        
+        # 构建新的 prompt cache
+        print(f"构建新的 prompt cache (key: {cache_key[:8]}...)")
+        current_model = self.get_or_load_voxcpm()
+        
+        # 如果需要降噪，先处理音频
+        actual_prompt_wav_path = prompt_wav_path
+        temp_prompt_wav_path = None
+        
+        try:
+            if denoise and current_model.denoiser is not None:
+                with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as tmp_file:
+                    temp_prompt_wav_path = tmp_file.name
+                current_model.denoiser.enhance(prompt_wav_path, output_path=temp_prompt_wav_path)
+                actual_prompt_wav_path = temp_prompt_wav_path
+            
+            # 构建 prompt cache
+            prompt_cache = current_model.tts_model.build_prompt_cache(
+                prompt_wav_path=actual_prompt_wav_path,
+                prompt_text=prompt_text
+            )
+            
+            # 缓存起来
+            self.prompt_cache_dict[cache_key] = prompt_cache
+            print(f"Prompt cache 已缓存 (key: {cache_key[:8]}...)")
+            
+            return prompt_cache
+            
+        finally:
+            # 清理临时文件
+            if temp_prompt_wav_path and os.path.exists(temp_prompt_wav_path):
+                try:
+                    os.unlink(temp_prompt_wav_path)
+                except OSError:
+                    pass
 
     def generate_tts_audio(
         self,
@@ -118,6 +280,8 @@ class VoxCPMDemo:
         """
         Generate speech from text using VoxCPM; optional reference audio for voice style guidance.
         Returns (sample_rate, waveform_numpy)
+        
+        对于长文本，会自动分割成多个片段分别生成，然后拼接，以避免显存溢出。
         """
         current_model = self.get_or_load_voxcpm()
 
