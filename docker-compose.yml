@@ -1,0 +1,30 @@
+services:
+  voxcpm-webui:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        USE_CHINA_MIRROR: ${USE_CHINA_MIRROR:-false}
+        APT_MIRROR_URL: ${APT_MIRROR_URL:-http://mirrors.aliyun.com/ubuntu/}
+        PYPI_MIRROR_URL: ${PYPI_MIRROR_URL:-https://mirrors.aliyun.com/pypi/simple/}
+    image: voxcpm-webui:latest
+    container_name: voxcpm-webui
+    user: "1000:1000"
+    ports:
+      - "8808:8808"
+    environment:
+      - USE_CHINA_MIRROR=${USE_CHINA_MIRROR:-false}
+      - APT_MIRROR_URL=${APT_MIRROR_URL:-http://mirrors.aliyun.com/ubuntu/}
+      - PYPI_MIRROR_URL=${PYPI_MIRROR_URL:-https://mirrors.aliyun.com/pypi/simple/}
+      - HF_HUB_OFFLINE=1
+      - TRANSFORMERS_OFFLINE=1
+    volumes:
+      - ./models:/app/models
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped

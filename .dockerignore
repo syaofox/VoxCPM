@@ -1,0 +1,47 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__
+*.py[cod]
+*$py.class
+*.egg-info
+.eggs
+.pytest_cache
+.mypy_cache
+.ruff_cache
+
+# Virtual environment
+.venv
+venv
+env/
+
+# Documentation (not needed in image)
+README.md
+README_zh.md
+LICENSE
+AGENTS.md
+
+# Scripts (run outside container)
+download_models.py
+download_models.sh
+run_offline.sh
+lora_ft_webui.py
+
+# Docker
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# Old app
+app_old.py
+
+# CI/CD
+.github/
+
+# Tests
+tests/
+
+# Examples (optional - not needed for webui)
+examples/
