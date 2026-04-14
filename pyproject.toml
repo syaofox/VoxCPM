@@ -59,6 +59,10 @@ dev = [
     "flake8>=3.8",
     "pre-commit>=2.0",
 ]
+cuda = [
+    "torch>=2.5.0",
+    "torchaudio>=2.5.0",
+]
 
 [project.scripts]
 voxcpm = "voxcpm.cli:main"

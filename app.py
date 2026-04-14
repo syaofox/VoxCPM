@@ -219,26 +219,46 @@ _APP_THEME = gr.themes.Soft(
 # ---------- Model ----------
 
 class VoxCPMDemo:
-    def __init__(self, model_id: str = "openbmb/VoxCPM2") -> None:
+    def __init__(
+        self,
+        model_id: str = "openbmb/VoxCPM2",
+        zipenhancer_path: str | None = None,
+        sensevoice_path: str | None = None,
+        local_files_only: bool = False,
+    ) -> None:
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         logger.info(f"Running on device: {self.device}")
 
-        self.asr_model_id = "iic/SenseVoiceSmall"
+        # Use local path if provided, otherwise use ModelScope ID
+        if sensevoice_path and os.path.isdir(sensevoice_path):
+            self.asr_model_id = sensevoice_path
+            self.asr_model_kwargs = {"hub": "ms", "disable_update": True}
+        else:
+            self.asr_model_id = sensevoice_path or "iic/SenseVoiceSmall"
+            self.asr_model_kwargs = {"disable_update": True}
+
         self.asr_model: Optional[AutoModel] = AutoModel(
             model=self.asr_model_id,
-            disable_update=True,
+            **self.asr_model_kwargs,
             log_level="DEBUG",
             device="cuda:0" if self.device == "cuda" else "cpu",
         )
 
         self.voxcpm_model: Optional[voxcpm.VoxCPM] = None
         self._model_id = model_id
+        self._zipenhancer_path = zipenhancer_path
+        self._local_files_only = local_files_only
 
     def get_or_load_voxcpm(self) -> voxcpm.VoxCPM:
         if self.voxcpm_model is not None:
             return self.voxcpm_model
         logger.info(f"Loading model: {self._model_id}")
-        self.voxcpm_model = voxcpm.VoxCPM.from_pretrained(self._model_id, optimize=True)
+        self.voxcpm_model = voxcpm.VoxCPM.from_pretrained(
+            self._model_id,
+            optimize=True,
+            local_files_only=self._local_files_only,
+            zipenhancer_model_id=self._zipenhancer_path,
+        )
         logger.info("Model loaded successfully.")
         return self.voxcpm_model
 
@@ -483,8 +503,16 @@ def run_demo(
     server_port: int = 8808,
     show_error: bool = True,
     model_id: str = "openbmb/VoxCPM2",
+    zipenhancer_path: str | None = None,
+    sensevoice_path: str | None = None,
+    local_files_only: bool = False,
 ):
-    demo = VoxCPMDemo(model_id=model_id)
+    demo = VoxCPMDemo(
+        model_id=model_id,
+        zipenhancer_path=zipenhancer_path,
+        sensevoice_path=sensevoice_path,
+        local_files_only=local_files_only,
+    )
     interface = create_demo_interface(demo)
     interface.queue(max_size=10, default_concurrency_limit=1).launch(
         server_name=server_name,
@@ -503,6 +531,24 @@ if __name__ == "__main__":
         "--model-id", type=str, default="openbmb/VoxCPM2",
         help="Local path or HuggingFace repo ID (default: openbmb/VoxCPM2)",
     )
+    parser.add_argument(
+        "--zipenhancer-path", type=str, default=None,
+        help="Local path to ZipEnhancer model (default: ModelScope ID)",
+    )
+    parser.add_argument(
+        "--sensevoice-path", type=str, default=None,
+        help="Local path to SenseVoiceSmall model (default: ModelScope ID)",
+    )
+    parser.add_argument(
+        "--local-files-only", action="store_true",
+        help="Only use local files, do not attempt to download",
+    )
     parser.add_argument("--port", type=int, default=8808, help="Server port")
     args = parser.parse_args()
-    run_demo(model_id=args.model_id, server_port=args.port)
+    run_demo(
+        model_id=args.model_id,
+        zipenhancer_path=args.zipenhancer_path,
+        sensevoice_path=args.sensevoice_path,
+        server_port=args.port,
+        local_files_only=args.local_files_only,
+    )

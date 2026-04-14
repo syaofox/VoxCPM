@@ -4950,6 +4950,10 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+cuda = [
+    { name = "torch" },
+    { name = "torchaudio" },
+]
 dev = [
     { name = "black" },
     { name = "flake8" },
@@ -4983,13 +4987,15 @@ requires-dist = [
     { name = "soundfile" },
     { name = "spaces" },
     { name = "torch", specifier = ">=2.5.0" },
+    { name = "torch", marker = "extra == 'cuda'", specifier = ">=2.5.0" },
     { name = "torchaudio", specifier = ">=2.5.0" },
+    { name = "torchaudio", marker = "extra == 'cuda'", specifier = ">=2.5.0" },
     { name = "torchcodec" },
     { name = "tqdm" },
     { name = "transformers", specifier = ">=4.36.2" },
     { name = "wetext" },
 ]
-provides-extras = ["dev"]
+provides-extras = ["dev", "cuda"]
 
 [[package]]
 name = "wetext"

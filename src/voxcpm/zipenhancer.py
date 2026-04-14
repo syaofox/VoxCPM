@@ -10,6 +10,7 @@ import tempfile
 from typing import Optional
 import torchaudio
 from modelscope.pipelines import pipeline
+from modelscope.pipelines.base import Pipeline
 from modelscope.utils.constant import Tasks
 
 
@@ -23,7 +24,11 @@ class ZipEnhancer:
             model_path: ModelScope model path or local path
         """
         self.model_path = model_path
-        self._pipeline = pipeline(Tasks.acoustic_noise_suppression, model=self.model_path)
+        kwargs = {"model": self.model_path}
+        # If model_path is a local directory, disable update to prevent network access
+        if os.path.isdir(model_path):
+            kwargs["disable_update"] = True
+        self._pipeline: Pipeline = pipeline(Tasks.acoustic_noise_suppression, **kwargs)
 
     def _normalize_loudness(self, wav_path: str):
         """
