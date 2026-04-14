@@ -11,6 +11,16 @@ export TRANSFORMERS_CACHE="$MODELS_DIR/huggingface"
 export MODELSCOPE_CACHE="$MODELS_DIR/modelscope"
 
 export HF_ENDPOINT="https://hf-mirror.com"
+#!/bin/bash
+# 自动加载 .env 文件中的变量
+if [ -f .env ]; then
+    export $(cat .env | xargs)
+    # 打印加载的环境变量（可选）
+    echo "Loaded environment variables from .env:"
+    echo "HUGGING_FACE_HUB_TOKEN: $HUGGING_FACE_HUB_TOKEN"
+
+fi
+
 # export HUGGING_FACE_HUB_TOKEN=""
 
 mkdir -p "$HF_HOME" "$MODELSCOPE_CACHE"
